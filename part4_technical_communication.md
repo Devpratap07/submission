@@ -2,7 +2,7 @@
 
 ## Task 4.1: Scenario Response
 
-**Reviewer question:** "Why did you choose this specific PR over the others? What made it comprehensible to you, and what challenges do you anticipate in implementing it?"
+**question:** "Why did you choose this specific PR over the others? What made it comprehensible to you, and what challenges do you anticipate in implementing it?"
 
 ---
 
@@ -15,8 +15,9 @@ I think there are three challenges. The first one is making sure the buffer is c
 The second challenge is making sure the ordering is correct when sending batches quickly. When `send_batch()` is called twice on the partition in a row the second call must wait for the first broker acknowledgement before sending. Getting this right without causing a deadlock especially if the first batch fails and the future never resolves cleanly requires handling of the wait logic and the error propagation path.
 
 The third challenge is the contract that says `append()` returns `None`. It seems simple. Once a batch is full every subsequent `append()` must keep returning `None` without touching the records that are already staged. If the internal buffer check has an off-, by-one error you could end up with a batch that appears full but has one record appended past the limit. I would write a targeted unit test for boundary behaviour before putting everything together.
+
 ---
 
-*I declare that all written content in this assessment is my own work, created without
+**I declare that all written content in this assessment is my own work, created without
 the use of AI language models or automated writing tools. All technical analysis and
-documentation reflects my personal understanding and has been written in my own words.*
+documentation reflects my personal understanding and has been written in my own words.**
