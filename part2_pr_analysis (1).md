@@ -6,7 +6,7 @@
 
 ---
 
-## PR #143 — Added metadata change listener if `group_id` is None
+## 1. PR #143 — Added metadata change listener if `group_id` is None
 
 **Link:** https://github.com/aio-libs/aiokafka/pull/143
 
@@ -38,21 +38,23 @@ This change fixes that problem, by making sure the consumer can find partitions 
 
 ### Implementation Approach
 
-The core fix is a targeted use of the `AIOKafkaClient`'s listener registration API. In the existing code, only the `GroupCoordinator` registered a metadata listener (`_handle_metadata_update`). The PR adds a lightweight equivalent directly inside `AIOKafkaConsumer.start()` when `group_id is None`. The listener callback inspects the new metadata snapshot — specifically the partition set for the subscribed topics — and compares it to the consumer's currently assigned partitions. If new partitions appear, it calls the fetcher's partition-update path to start fetching from them.
-
-The approach is deliberately minimal: rather than duplicating the full `GroupCoordinator` logic, the PR inserts a single callback that does only the one thing a standalone consumer actually needs on a metadata change — updating its partition assignment. Because `asyncio` callbacks are single-threaded, there are no concurrency concerns around the listener itself. The corresponding `stop()` teardown removes the listener, which matches how the `GroupCoordinator` already cleans itself up, keeping the lifecycle symmetric.
+The main fix is to use the listener registration in a specific way. Now the `GroupCoordinator` is the only thing that registers a metadata listener, which is the `_handle_metadata_update` function. This update adds a version of that listener directly to the `AIOKafkaConsumer.start()` function when there is no `group_id`.
+This new listener looks at the metadata and checks the partitions for the topics we are interested in. It then compares that to the partitions the consumer is currently using. If it finds partitions it tells the fetcher to start getting data from them.
+We did this in a simple way, on purpose. Of copying all the `GroupCoordinator` code we just added a small callback that does the one thing a consumer needs when the metadata changes. It updates the partitions. Since `asyncio` callbacks only happen one at a time we do not have to worry about things trying to change the listener at the same time.
+When we call `stop()` we remove the listener, which's the same way the `GroupCoordinator` cleans up after itself. This keeps everything working in a way. The `AIOKafkaClient` listener registration is used in a way to make this work. The `AIOKafkaConsumer` is what uses the `listener registration.
 
 ---
 
 ### Potential Impact
 
-This fix directly affects all users running `AIOKafkaConsumer` without a `group_id` — typically cases where a consumer is manually managing its own partition assignments (e.g., a replay tool or an audit log reader). The change makes those consumers responsive to broker-side changes that previously went undetected. There is minimal risk to group-based consumers because the new listener registration is entirely inside the `if self._group_id is None` branch; the standard coordinator-based path is untouched.
+This change is important for people who use `AIOKafkaConsumer` without a `group_id`. This is usually the case when someone is in control of how the consumer works with partitions. For example this could be a tool that replays something or a reader for audit logs.
+The update makes these consumers pay attention to changes, from the broker that they did not notice before. There is not much to worry about for consumers that're part of a group because the new way of registering listeners only happens when there is no `group_id`. The usual way of doing things with a coordinator is not affected.
 
 ---
 
 ---
 
-## PR #217 — Added lightweight batching interface to `AIOKafkaProducer`
+## 2. PR #217 — Added lightweight batching interface to `AIOKafkaProducer`
 
 **Link:** https://github.com/aio-libs/aiokafka/pull/217
 
@@ -60,7 +62,13 @@ This fix directly affects all users running `AIOKafkaConsumer` without a `group_
 
 ### PR Summary
 
-Before this PR, the only way to send messages with `AIOKafkaProducer` was through `send()` or `send_and_wait()`, both of which hand over control of batching entirely to the internal message accumulator. That works well for most cases, but there are situations — like when you're reading from an incoming stream that can't advance until delivery is confirmed — where you genuinely need to build a batch yourself, decide when it's full, and submit it as a unit. Calling `send_and_wait()` in a loop for each message is far too slow for that. This PR introduces two new methods, `create_batch()` and `send_batch()`, that let callers construct a `BatchBuilder` object, append messages to it manually, and then dispatch the whole thing to a specific partition in one shot. It's a lower-level API that skips the automatic partitioner and serializer, but in exchange gives you direct control over exactly what goes into each batch and when it gets sent.
+Before this update the only way to send messages with `AIOKafkaProducer` was through `send()` or `send_and_wait()`. Both of these methods let the internal message accumulator handle batching. This works well in cases.
+
+However there are situations where you need to build a batch yourself. For example when you're reading from a stream that can't move forward until delivery is confirmed. In cases you need to decide when the batch is full and submit it as a unit.
+
+Calling `send_and_wait()` in a loop for each message is too slow. This update introduces two methods: `create_batch()` and `send_batch()`. These methods let you create a `BatchBuilder` object. You can add messages to it manually. Then you can send the batch to a specific partition at once.
+
+This is a lower-level API. It does not use the partitioner and serializer.. It gives you direct control over what goes into each batch and when it gets sent. You have control, over `AIOKafkaProducer` and `BatchBuilder`. You can use `create_batch()` and `send_batch()` with `AIOKafkaProducer`.
 
 ---
 
@@ -84,16 +92,26 @@ Before this PR, the only way to send messages with `AIOKafkaProducer` was throug
 
 ### Implementation Approach
 
-The design centres on a `BatchBuilder` object that acts as a staging area for a fixed-size group of records. When you call `create_batch()`, the producer hands back a `BatchBuilder` pre-configured with the producer's compression codec and the `max_batch_size` limit. You then call `batch.append(key, value, timestamp)` in a loop — this returns a future-like metadata object on success, or `None` when the buffer is full. That `None` return is the signal to the caller to stop appending, call `send_batch()` with the current batch, and then create a fresh one to continue.
+The design focuses on a `BatchBuilder` object. It acts as an area for a group of records. The group size is fixed.
 
-Under the hood, `send_batch()` bypasses the normal `send()` path — it does not invoke the partitioner, does not apply key/value serializers, and does not go through the per-message accumulator logic. Instead it drops the pre-built buffer directly into the accumulator for the target partition and waits for the delivery future. If another batch for that partition is already in flight, the call blocks until that earlier batch is acknowledged before submitting the new one, which keeps ordering guarantees intact.
+When you call `create_batch()` you get a `BatchBuilder` object. It is already set up with a compression codec and a maximum batch size limit.
 
-This approach keeps the existing `send()` path completely untouched. It's an additive API that sits alongside the automatic path rather than refactoring it, which keeps the risk of regressions low.
+You then add records to the batch in a loop. You call `batch.append(key, value timestamp)`. This returns some metadata if it works.. It returns `None` if the buffer is full.
+
+When you get `None` you stop adding records. You call `send_batch()` with the batch. Then you create a batch to continue.
+
+The `send_batch()` function works differently. It does not use the send()` path. It does not decide which partition to send to. It also does not change the key and value.
+
+Instead it sends the batch directly to the accumulator for the target partition. It waits for the batch to be delivered. If another batch, for the partition is being sent, `send_batch()` waits until that batch is sent.
+
+This approach does not change the existing `send()` path. It adds a way to send batches. This keeps the risk of problems.
 
 ---
 
 ### Potential Impact
 
-The main users of this are applications that need deterministic control over batch boundaries — things like stream processors where you want all the records from one upstream chunk to land in a single Kafka batch, or load testing tools that need to produce at a specific rate. Any code that doesn't call `create_batch()` or `send_batch()` is completely unaffected. One thing worth noting is that because `send_batch()` skips the key serializer and partitioner, callers have to handle their own partition selection and pre-encode their keys and values as bytes — it's more verbose to use, but that's a reasonable trade-off for the control it gives.
+The main users of this feature are applications that require control over batch boundaries. For example stream processors need all the records from one chunk to be in a Kafka batch. Load testing tools also use this feature because they need to produce records at a rate.
+
+Applications that do not use `create_batch()` or `send_batch()` are not affected by this feature. One important thing to note about `send_batch()` is that it skips some steps so the person using it has to handle some work. They have to choose which partition to use and make sure their keys and values are in the format. This means the code is a bit longer and more complicated. It gives the user more control over what is happening which is a good trade-off for Kafka batch and the applications that use it, like stream processors and load testing tools.
 
 ---
