@@ -34,61 +34,60 @@ The code is organised into a package with sub-modules. These sub-modules handle 
 
 ## 3.1.2 Pull Request Description
 
-PR #217 adds a lightweight manual batching interface to `AIOKafkaProducer` through two new public methods: `create_batch()` and `send_batch()`.
+PR #217 adds a way to manually batch messages to `AIOKafkaProducer`. It does this by adding two methods: `create_batch` and `send_batch`.
 
-Before this change the only way to send messages was by using `send()` or `send_and_wait()`. These methods automatically group records by topic and partition. They also respect the `max_batch_size` and how to wait before sending a batch. This works well for cases but it does not work well when you need to control exactly what goes into each batch and when it is sent.
+Before this change you could only send messages using send or send_and_wait. These methods group records by topic and partition automatically. They also follow the `max_batch_size` rule. Know how to wait before sending a batch. This works well in some cases. It does not work well when you need to control exactly what goes into each batch and when it is sent.
 
-For example if you need to confirm that messages are delivered before you can move on using `send_and_wait()` in a loop is too slow. This is especially true when you have a lot of messages coming in quickly and you need to make sure they are all delivered.
+For example if you need to make sure messages are delivered before you can move on using `send_and_wait` in a loop is too slow. This is especially true when you have a lot of messages coming in quickly and you need to make sure they are all delivered.
 
-This change introduces `create_batch()`, which gives you a `BatchBuilder` object. This object is set up with the producers compression and `max_batch_size`. You can add messages to the BatchBuilder using its `append` method. When the buffer is full the append method will return `None`, which's, like a signal to stop and send the batch.
+This change introduces create_batch, which gives you a BatchBuilder object. This object is set up with the producers compression and `max_batch_size`. You can add messages to the BatchBuilder using its append method. When the buffer is full the append method will return None, which's like a signal to stop and send the batch.
 
-Now AIOKafkaProducer has a way to build and send batches to a specific partition. The old `send` and `send_and_wait` methods still work the way. The new method is an addition. One thing to note is that `send_batch()` does not use the serializer and partitioner so you have to give it pre-encoded keys and values and choose the partition yourself.
-
+Now `AIOKafkaProducer` has a way to build and send batches to a partition. The old send and send_and_wait methods still work the way. The new method is an addition, to `AIOKafkaProducer`. One thing to note is that send_batch does not use the serializer and partitioner so you have to give it pre-encoded keys and values and choose the partition for `AIOKafkaProducer` yourself.
 
 
 ---
 
 ## 3.1.3 Acceptance Criteria
 
-✓ When `create_batch()` is called on a started producer, it returns a `BatchBuilder` instance configured with the producer's current `compression_type` and `max_batch_size`.
+✓ When you call `create_batch()` on a producer that has already started it gives you a `BatchBuilder` instance. This instance is set up with the producers settings for `compression_type` and `max_batch_size`.
 
-✓ When `batch.append(key, value, timestamp)` is called and the buffer still has room, it returns a non-`None` metadata object and the message is staged in the batch.
+✓ If you call `batch.append(key, value timestamp)` and there is still space in the buffer it returns some metadata. Adds the message to the batch.
 
-✓ When `batch.append(key, value, timestamp)` is called and the buffer is full (i.e., adding the record would exceed `max_batch_size`), it returns `None` and does not modify the batch — the caller can then call `send_batch()` and start a new batch.
+✓. If you call `batch.append(key, value timestamp)` and the buffer is full. That is adding the record would make it too big. It returns `None` and does not change the batch. You can then call `send_batch()`. Start a new batch.
 
-✓ When `send_batch(batch, topic, partition=N)` is called with a completed `BatchBuilder`, all records in the batch are delivered to the specified topic-partition as a single Kafka batch, and the returned future resolves only after the broker acknowledges delivery.
+✓ When you call `send_batch(batch, topic, partition=N)` with a completed `BatchBuilder` all the records in the batch are sent to the specified topic and partition as one Kafka batch. The function only continues after the broker confirms it got the batch.
 
-✓ When `send_batch()` is called for a partition that already has an in-flight batch, the call blocks (or queues) until the earlier batch is acknowledged before submitting the new one, preserving per-partition message ordering.
+✓ If you call `send_batch()` for a partition that already has a batch being sent the call waits until the first batch is confirmed before sending the one. This keeps the order of messages for each partition.
 
-✓ When `send_batch()` is called with a topic or partition that does not exist or is otherwise invalid, it raises a clear exception (such as `KafkaTimeoutError` or `UnknownTopicOrPartitionError`) rather than silently dropping the batch.
+✓ If you call `send_batch()` with a topic or partition that does not exist or is invalid it raises an error, like `KafkaTimeoutError` or `UnknownTopicOrPartitionError`. It does not just drop the batch.
 
-✓ Any code that does not call `create_batch()` or `send_batch()` is completely unaffected — all existing `send()` and `send_and_wait()` behaviour remains identical.
+✓ Any code that does not use `create_batch()` or `send_batch()` works the same as before. The existing `send()` and `send_and_wait()` behaviour does not change.
 
-✓ The `BatchBuilder.append()` method correctly handles byte keys/values; it must not attempt to apply the producer's key or value serialiser — those are bypassed by design.
+✓ The `BatchBuilder.append()` method handles byte keys and values correctly. It does not try to use the producers value serializer because that is not needed here.
 
 ---
 
 ## 3.1.4 Edge Cases
 
-**1. Appending after the batch is full and `None` has been returned**
+**1. Adding to the batch after it is full and `None` has been returned**
 
-If a caller ignores the `None` return from `append()` and continues calling `append()` on a full batch, the implementation must consistently return `None` for every subsequent call without corrupting the already-staged records. The batch should remain in its last valid state so it can still be dispatched correctly with `send_batch()`.
+When someone keeps adding to the batch after it's full and `None` has been returned the system must always return `None` for every call after that. This is so the batch does not get messed up and the records that are already in the batch can still be sent with `send_batch()`. The batch should stay the same so it can be sent correctly.
 
-**2. Calling `send_batch()` on an empty `BatchBuilder`**
+**2. Calling `send_batch()` on a BatchBuilder`**
 
-If a caller creates a batch, appends nothing to it, and then calls `send_batch()`, the implementation should either reject the call with a clear error or, if it proceeds, produce a valid but empty Kafka batch that the broker accepts. Silently succeeding with undefined behaviour (e.g., hanging forever waiting for an ack that never comes) is not acceptable.
+If someone makes a batch does not add anything to it and then tries to send it with `send_batch()` the system should either say no with a clear error or send an empty batch that Kafka can handle. It is not okay if the system just does nothing and does not say what is happening.
 
-**3. Network failure or timeout during `send_batch()` delivery**
+**3. Network. Timeout during `send_batch()` delivery**
 
-If the broker is unreachable or the request exceeds `request_timeout_ms` while `send_batch()` is waiting for acknowledgement, the method should raise `KafkaTimeoutError` (or the underlying connection error) to the caller. The caller must be able to detect failure and decide whether to retry — the implementation must not silently swallow the error or mark the batch as delivered when it was not.
+If the Kafka server is not available or it takes long to get a response while `send_batch()` is waiting the method should say there is a `KafkaTimeoutError` or a connection error. This is so the person using the system can see what went wrong and decide what to do. The system must not just hide the error. Say the batch was sent when it was not.
 
 **4. Calling `create_batch()` or `send_batch()` before `producer.start()`**
 
-If either method is called on a producer that has not been started yet, the implementation should raise a clear error immediately rather than hanging indefinitely or producing a cryptic `AttributeError` from an uninitialised internal state. This is consistent with how the existing `send()` method behaves before start.
+If someone tries to make a batch or send a batch before the producer is started the system should say there is an error away. It should not just wait forever. Give a strange error because something is not set up right. This is the same as what happens when someone tries to send a message before the producer is started.
 
-**5. Large batches that exceed broker-side `message.max.bytes`**
+**5. Large batches that exceed the Kafka servers `message.max.bytes`**
 
-The `max_batch_size` on the producer is a client-side limit, but the broker also has its own maximum message size. If a caller fills a `BatchBuilder` to the client-side `max_batch_size` and that size exceeds the broker's configured limit, `send_batch()` will receive a broker-side error. The implementation should propagate this as a meaningful exception rather than a silent failure or an infinite retry loop.
+The `max_batch_size` on the producer is a limit on the client side. The Kafka server also has its own limit for how big a message can be. If someone fills a `BatchBuilder` to the client-side limit and that is bigger than the Kafka servers limit, `send_batch()` will get an error, from the Kafka server. The system should pass on this error in a way that makes sense than just failing quietly or trying again forever.
 
 ---
 
