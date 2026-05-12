@@ -95,144 +95,77 @@ The `max_batch_size` on the producer is a client-side limit, but the broker also
 ## 3.1.5 Initial Prompt
 
 ```
-The AIOKafkaProducer class in the library is getting two new public methods: create_batch and send_batch.
 
-These methods are used for the Python asyncio-based Kafka client.
+To implement a batching interface for the AIOKafkaProducer class in the aiokafka library we will add two new public methods, create_batch and send_batch along with a supporting BatchBuilder class.
 
-All network operations must be implemented as coroutines.
+The AIOKafkaProducer class lives in aiokafka/producer.py. When you call send today it hands the record off to a MessageAccumulator, which quietly groups records into batches per topic-partition and flushes them based on linger_ms and max_batch_size.
 
-No blocking calls are permitted.
+The problem with the API is that it gives you no control over batch boundaries. If you need all the records from one chunk to land in a single Kafka batch calling send_and_wait in a loop per message is way too slow.
 
-The AIOKafkaProducer class is defined in aiokafka/producer.py.
+## A bit of background on the codebase
 
-Its internal batching and delivery logic lives in aiokafka/message_accumulator.py.
+The aiokafka library is a Python asyncio library. Every network call you write must be a coroutine. No blocking code is allowed anywhere in the implementation.
 
-When send is called individual records are appended to the accumulator,
+The AIOKafkaClient in aiokafka/client.py has a send coroutine that takes a Kafka protocol request and gives back a response.
 
-which groups them into MessageBatch objects per topic-partition and flushes them to the broker.
+## What you need to implement
 
-The producer communicates with Kafka brokers via AIOKafkaClient,
+### 1. Create_batch on
 
-which exposes a send coroutine that accepts Kafka protocol request objects and returns response objects.
+This is a plain synchronous method. It returns a BatchBuilder pre-configured with the producers compression_type and max_batch_size. If someone calls this before calling producer.start raise an error right away.
 
-The producer is initialized with configuration including compression_type,
+### 2. Send_batch on AIOKafkaProducer
 
-max_batch_size, request_timeout_ms and acks.
+This takes a completed BatchBuilder, a topic name and a partition number. It does a sanity check that the topic and partition actually exist and are reachable. Then it submits the -built batch directly into the MessageAccumulator for that topic-partition completely bypassing the normal per-message send path.
 
-These settings govern how the accumulator builds and delivers batches.
+It returns a future that resolves once the broker has acknowledged the batch. If theres already a batch in flight for the partition wait for that one to finish before dispatching the new one.
 
-Here are the things that need to be implemented:
+### 3. BatchBuilder class
 
-1. The create_batch method on returns a new BatchBuilder instance
+The constructor takes compression_type. Max_batch_size. Its main method is append, which takes key, value and timestamp. Key and value should be bytes. On success return a metadata object. When the buffer is full return None without raising an exception.
 
-configured with the producers current compression_type and max_batch_size.
+### 4. Add_batch method on MessageAccumulator
 
-This is a method.
+Add a method that accepts a -built BatchBuilder and slots it directly into the queue for the target topic-partition.
 
-It must raise an error if called before producer.start.
+## What I need the implementation to get right
 
-2. The send_batch method on AIOKafkaProducer accepts a completed BatchBuilder,
+create_batch must return a BatchBuilder that reflects the producers compression_type and max_batch_size. After append returns None, the records that were already staged must be intact and deliverable. Send_batch must deliver everything in the batch to the partition you specify.
 
-a topic name and a required keyword argument partition.
+If a batch for the partition is already in flight the new one must wait its turn. Preserve ordering. On any network failure or timeout raise the error to the caller. Both new methods must fail fast. Clearly if start hasn't been called yet.
 
-It validates that the topic and partition are reachable.
+## Edge cases worth thinking about
 
-It submits the -built batch directly to the MessageAccumulator for the specified topic-partition
+buffer behaviour. Once append has returned None it should keep returning None for every subsequent call. Batch. If someone calls send_batch on a BatchBuilder they never appended anything to either reject it with a meaningful error or send a valid empty batch.
 
-bypassing the normal per-message send path entirely.
+Network problems -send. If the broker goes away or the request times out while send_batch is waiting for acknowledgement the exception should bubble up to the caller cleanly. Using the API before start. Both create_batch and send_batch should blow up immediately with a message if start hasn't been called.
 
-It returns a future that resolves when the broker acknowledges delivery.
+## Files to change
 
-If another batch for the partition is already in flight
+We need to change the following files:
 
-it blocks until that earlier batch is acknowledged before dispatching the new one
+* aiokafka/producer.py. Add create_batch and send_batch to AIOKafkaProducer
 
-to preserve ordering.
+* aiokafka/message_accumulator.py. Add the BatchBuilder class and the add_batch method to MessageAccumulator
 
-It must raise an error if called before producer.start.
+* examples/batch_produce.py. Example script showing the full create → append → send loop with partition selection
 
-3. The BatchBuilder class has a constructor that accepts compression_type and max_batch_size.
+* tests/test_producer.py. New integration tests
 
-It has an append method that accepts key, value and timestamp.
+## Tests I want to see
 
-The key and value must be bytes.
+We need to cover the following test cases:
 
-It returns a -None metadata object on success.
+1. Happy path. Create a batch append a known set of records send it to a partition then start a consumer on that partition and verify every record arrives in the exact order it was appended.
 
-It returns None when the buffer is full.
+2. Full-buffer flow. Keep calling append until it returns None then send that batch and create an one for the remaining records send that too and verify all records land.
 
-After returning None every subsequent call must also return None without modifying the batch.
+3. In-flight ordering. Call send_batch twice on the partition in quick succession without awaiting the first. Once both settle confirm both batches arrived in the order and neither was dropped.
 
-4. The add_batch method in MessageAccumulator accepts a -built BatchBuilder
+4. Pre-start error. Call create_batch. Send_batch on a producer that hasn't been started. Assert that a clear descriptive exception is raised away.
 
-and enqueues it for the target topic-partition bypassing the per-record add_message logic.
+5. Bad partition. Call send_batch targeting a partition that doesn't exist on the topic. Assert that a KafkaTimeoutError or UnknownTopicOrPartitionError is raised than hanging.
 
-The implementation must satisfy these acceptance criteria:
+All async test code should use await. No loop.run_until_complete, in the library itself.
 
-- create_batch returns a BatchBuilder configured with the producers compression_type and max_batch_size.
-
-- batch.append returns None when the buffer's full; the already-staged records remain intact.
-
-- send_batch delivers all staged records to exactly the specified topic-partition as a single batch;
-
-the broker acknowledges them before the future resolves.
-
-- If another batch for the partition is already in flight send_batch queues rather than fails.
-
-- send_batch raises a clear exception on network failure or timeout. No silent data loss.
-
-- Calling either method before producer.start raises an error immediately.
-
-- All existing send and send_and_wait behaviour remains identical. The new API is purely additive.
-
-- BatchBuilder.append does NOT invoke the producers key/value serialisers;
-
-callers are responsible for supplying pre-encoded bytes.
-
-These are the edge cases to handle:
-
-- Appending to a batch: after append returns None all further calls must also return None without corrupting existing records.
-
-- Empty batch sent via send_batch: either reject clearly or produce a valid empty Kafka batch. Do not hang.
-
-- Network failure during send_batch: propagate KafkaTimeoutError or the connection error to the caller; do not swallow.
-
-- Pre-start usage: both create_batch and send_batch must fail fast with a descriptive error if start has not been called.
-
-- Broker-side size rejection: if the batch exceeds the brokers message.max.bytes
-
-surface the broker error as a meaningful exception rather than retrying indefinitely.
-
-These are the files to modify:
-
-- aiokafka/producer.py. Add create_batch and send_batch to AIOKafkaProducer
-
-- aiokafka/message_accumulator.py. Add BatchBuilder class and the add_batch path to MessageAccumulator
-
-- examples/batch_produce.py. Add an example script demonstrating the full create → append → send loop with partition selection
-
-- tests/test_producer.py. Add integration tests
-
-These are the testing requirements:
-
-1. Normal batch delivery: produce known records via create_batch / send_batch,
-
-then consume from the partition and verify every record arrives in order.
-
-2. Full-buffer signal: fill a BatchBuilder until append returns None
-
-then send the batch and a second batch verifying all records are delivered.
-
-3. Partition in-flight ordering: call send_batch twice on the same partition
-
-in quick succession without awaiting the first; verify both batches are delivered in order and neither is dropped.
-
-4. Unstarted producer: call create_batch or send_batch before start and assert an exception is raised immediately.
-
-5. Invalid partition: call send_batch targeting a partition that does not exist
-
-and assert a KafkaTimeoutError or UnknownTopicOrPartitionError is raised.
-
-Do not add any external dependencies.
-
-All async test code must use await; no loop.run_until_complete, inside library code.
+---
