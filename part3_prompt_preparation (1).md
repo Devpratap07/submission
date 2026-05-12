@@ -1,6 +1,6 @@
 # Part 3: Prompt Preparation
 
-**PR selected for this section:** [aiokafka #217 — Added lightweight batching interface to `AIOKafkaProducer`](https://github.com/aio-libs/aiokafka/pull/217)
+**PR selected for this section:** aiokafka #217 — Added lightweight batching interface to `AIOKafkaProducer`(https://github.com/aio-libs/aiokafka/pull/217)
 
 ---
 
