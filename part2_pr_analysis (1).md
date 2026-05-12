@@ -38,10 +38,10 @@ This change fixes that problem, by making sure the consumer can find partitions 
 
 ### Implementation Approach
 
-The main fix is to use the listener registration in a specific way. Now the `GroupCoordinator` is the only thing that registers a metadata listener, which is the `_handle_metadata_update` function. This update adds a version of that listener directly to the `AIOKafkaConsumer.start()` function when there is no `group_id`.
-This new listener looks at the metadata and checks the partitions for the topics we are interested in. It then compares that to the partitions the consumer is currently using. If it finds partitions it tells the fetcher to start getting data from them.
-We did this in a simple way, on purpose. Of copying all the `GroupCoordinator` code we just added a small callback that does the one thing a consumer needs when the metadata changes. It updates the partitions. Since `asyncio` callbacks only happen one at a time we do not have to worry about things trying to change the listener at the same time.
-When we call `stop()` we remove the listener, which's the same way the `GroupCoordinator` cleans up after itself. This keeps everything working in a way. The `AIOKafkaClient` listener registration is used in a way to make this work. The `AIOKafkaConsumer` is what uses the `listener registration.
+- The main fix is to use the listener registration in a specific way. Now the `GroupCoordinator` is the only thing that registers a metadata listener, which is the `_handle_metadata_update` function. This update adds a version of that listener directly to the `AIOKafkaConsumer.start()` function when there is no `group_id`.
+- This new listener looks at the metadata and checks the partitions for the topics we are interested in. It then compares that to the partitions the consumer is currently using. If it finds partitions it tells the fetcher to start getting data from them.
+- We did this in a simple way, on purpose. Of copying all the `GroupCoordinator` code we just added a small callback that does the one thing a consumer needs when the metadata changes. It updates the partitions. Since `asyncio` callbacks only happen one at a time we do not have to worry about things trying to change the listener at the same time.
+- When we call `stop()` we remove the listener, which's the same way the `GroupCoordinator` cleans up after itself. This keeps everything working in a way. The `AIOKafkaClient` listener registration is used in a way to make this work. The `AIOKafkaConsumer` is what uses the `listener registration.
 
 ---
 
@@ -51,6 +51,8 @@ This change is important for people who use `AIOKafkaConsumer` without a `group_
 The update makes these consumers pay attention to changes, from the broker that they did not notice before. There is not much to worry about for consumers that're part of a group because the new way of registering listeners only happens when there is no `group_id`. The usual way of doing things with a coordinator is not affected.
 
 ---
+
+
 
 ---
 
@@ -92,19 +94,19 @@ This is a lower-level API. It does not use the partitioner and serializer.. It g
 
 ### Implementation Approach
 
-The design focuses on a `BatchBuilder` object. It acts as an area for a group of records. The group size is fixed.
+- The design focuses on a `BatchBuilder` object. It acts as an area for a group of records. The group size is fixed.
 
-When you call `create_batch()` you get a `BatchBuilder` object. It is already set up with a compression codec and a maximum batch size limit.
+- When you call `create_batch()` you get a `BatchBuilder` object. It is already set up with a compression codec and a maximum batch size limit.
 
-You then add records to the batch in a loop. You call `batch.append(key, value timestamp)`. This returns some metadata if it works.. It returns `None` if the buffer is full.
+- You then add records to the batch in a loop. You call `batch.append(key, value timestamp)`. This returns some metadata if it works.. It returns `None` if the buffer is full.
 
-When you get `None` you stop adding records. You call `send_batch()` with the batch. Then you create a batch to continue.
+- When you get `None` you stop adding records. You call `send_batch()` with the batch. Then you create a batch to continue.
 
-The `send_batch()` function works differently. It does not use the send()` path. It does not decide which partition to send to. It also does not change the key and value.
+- The `send_batch()` function works differently. It does not use the send()` path. It does not decide which partition to send to. It also does not change the key and value.
 
-Instead it sends the batch directly to the accumulator for the target partition. It waits for the batch to be delivered. If another batch, for the partition is being sent, `send_batch()` waits until that batch is sent.
+- Instead it sends the batch directly to the accumulator for the target partition. It waits for the batch to be delivered. If another batch, for the partition is being sent, `send_batch()` waits until that batch is sent.
 
-This approach does not change the existing `send()` path. It adds a way to send batches. This keeps the risk of problems.
+- This approach does not change the existing `send()` path. It adds a way to send batches. This keeps the risk of problems.
 
 ---
 
